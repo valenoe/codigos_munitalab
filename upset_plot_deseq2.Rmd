@@ -1,0 +1,205 @@
+---
+title: "upset_plot_deseq"
+author: "vale"
+date: "2025-04-03"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## Introducción
+
+Este documento presenta un análisis de genes diferencialmente expresados entre múltiples comparaciones utilizando la visualización UpSet plot. Esta técnica nos permite identificar los genes compartidos y únicos entre las distintas condiciones experimentales.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Carga de librerías
+
+Comenzamos cargando la librería UpSetR necesaria para crear los diagramas de intersección.
+
+```{r}
+library(UpSetR)
+```
+
+## Funciones de análsis
+
+### Diagnóstico de archivos
+
+La siguiente función examina los archivos de resultados de DESeq2 para verificar la estructura y la distribución de genes up y down-regulated en cada comparación.
+
+```{r}
+# Función de diagnóstico detallado
+diagnosticar_archivos <- function(archivos) {
+  for (nombre in names(archivos)) {
+    cat("\n=== Diagnóstico de", nombre, "===\n")
+    
+    # Leer el archivo
+    df <- read.csv(archivos[[nombre]], stringsAsFactors = FALSE)
+    
+    # Contar valores en la columna 'significant'
+    conteo <- table(df$significant)
+    cat("Conteo de valores en 'significant':\n")
+    print(conteo)
+    
+    # Verificar primeros valores
+   # cat("\nPrimeros valores de 'significant':\n")
+    #print(head(df$significant))
+  }
+}
+```
+
+
+### Generación de UpSet plots
+
+Esta función crea visualizaciones UpSet para identificar los patrones de solapamiento entre genes diferencialmente expresados en múltiples comparaciones. La función puede generar diagramas tanto para genes sobre-expresados (up-regulated) como sub-expresados (down-regulated).
+```{r}
+
+# Función para crear UpSet plot de DESeq2
+crear_upset_deseq2 <- function(archivos, tipo = "up") {
+  # Crear lista para almacenar genes
+  lista_genes <- list()
+  
+  # Procesar cada archivo
+  for (nombre in names(archivos)) {
+    # Leer el archivo CSV
+    df <- read.csv(archivos[[nombre]])
+    
+    # Filtrar según el tipo (up o down)
+    if (tipo == "up") {
+      genes <- df$gene_name[df$significant == "Up"]
+    } else if (tipo == "down") {
+      genes <- df$gene_name[df$significant == "Down"]
+    } else {
+      stop("Tipo debe ser 'up' o 'down'")
+    }
+    
+    # Almacenar genes únicos
+    lista_genes[[nombre]] <- unique(genes)
+  }
+  
+  # Crear matriz de presencia/ausencia
+  todos_genes <- unique(unlist(lista_genes))
+  
+  # Crear matriz de presencia
+  matriz_presencia <- matrix(0, 
+                             nrow = length(todos_genes), 
+                             ncol = length(lista_genes))
+  rownames(matriz_presencia) <- todos_genes
+  colnames(matriz_presencia) <- names(lista_genes)
+  
+  # Rellenar matriz
+  for (i in seq_along(lista_genes)) {
+    indices <- match(lista_genes[[i]], rownames(matriz_presencia))  # Buscar índices de los genes en la matriz
+    indices <- indices[!is.na(indices)]  # Filtrar valores NA para evitar errores
+    matriz_presencia[indices, i] <- 1
+  }
+  
+  # Convertir a dataframe
+  df_presencia <- as.data.frame(matriz_presencia)
+  
+  
+  
+  # Crear UpSet plot
+  
+  upset_plot <-upset(df_presencia, 
+              sets = colnames(df_presencia),
+              sets.bar.color = "#5cc0c0",
+              order.by = "freq", 
+              empty.intersections = "on",
+              main.bar.color = if(tipo == "up") "#C71F3D" else "#3D71C7",
+              mainbar.y.label = paste("Número de", tipo, "regulated genes"),
+              sets.x.label = "Número de genes por comparación",
+              text.scale = 1,
+              point.size = 2.5,
+              line.size = 1.0,
+              mb.ratio = c(0.6, 0.4),
+              set_size.show = TRUE,
+              #main.bar.color.alpha = 0.7,
+              matrix.color = if(tipo == "up") "#C71F3D" else "#3D71C7")
+  
+  
+  nombre_archivo <- paste0("upset_", tipo, "_regulated_genes.png")
+  png(nombre_archivo, width = 1400, height = 800, res = 150)
+  print(upset_plot)
+  dev.off()
+  
+  cat("\nUpSet plot guardado como:", nombre_archivo)
+  
+  nombre_archivo <- paste0("upset_", tipo, "_regulated_genes.pdf")
+  pdf(nombre_archivo, width = 10, height = 6) 
+  print(upset_plot)
+  dev.off()
+  
+  cat("\nUpSet plot guardado como:", nombre_archivo)
+  
+  # Devolver información adicional
+  return(list(
+    plot = upset_plot,
+    total_genes = length(todos_genes),
+    genes_por_comparacion = sapply(lista_genes, length)
+  ))
+}
+
+```
+
+
+## Análisis de datos
+
+### Definicion de aechivos de entrada
+
+Primero, definimos los archivos de resultados de DESeq2 para cada una de nuestras comparaciones experimentales.
+
+```{r}
+archivos <- list(
+  "U5A_vs_CTRL" = "deseq2_resultsA.csv",
+  "U5B_vs_CTRL" = "deseq2_resultsB.csv",
+  "U5D_vs_CTRL" = "deseq2_resultsD.csv",
+  "U5E_vs_CTRL" = "deseq2_resultsE.csv",
+  "U5F_vs_CTRL" = "deseq2_resultsF.csv"
+)
+
+
+```
+### Diagnóstico inicial
+
+Realizamos un diagnóstico de los archivos para verificar la cantidad de genes up y down-regulated en cada comparación.
+```{r}
+diagnosticar_archivos(archivos)
+```
+
+### Análisis de genes sobre-expresados (Up-regulated)
+
+Creamos y visualizamos el UpSet plot para genes sobre-expresados a través de las cinco comparaciones.
+```{r}
+# Crear UpSet plots para genes up-regulated y down-regulated
+resultado_up <- crear_upset_deseq2(archivos, "up")
+
+# Display the plot
+resultado_up$plot
+
+# Imprimir información adicional
+print("Resumen de genes up-regulated:")
+print(resultado_up$genes_por_comparacion)
+
+
+
+```
+### Análisis de genes sub-expresados (Down-regulated)
+
+A continuación, realizamos el mismo análisis para genes sub-expresados.
+```{r}
+resultado_down <- crear_upset_deseq2(archivos, "down")
+
+# Display the plot
+resultado_down$plot
+
+print("Resumen de genes down-regulated:")
+print(resultado_down$genes_por_comparacion)
+```
+
+
+
+
