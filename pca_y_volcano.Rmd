@@ -1,0 +1,249 @@
+---
+title: "Individual_volcano_and_PCA_plot_deseq2"
+author: "vale"
+date: "2025-04-04"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## Introducción
+
+Este documento presenta un análisis de expresión diferencial de genes mediante la visualización de gráficos Volcano y análisis de componentes principales (PCA). Estas visualizaciones permiten identificar genes diferencialmente expresados y explorar las relaciones entre diferentes condiciones experimentales.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Carga de librerías
+
+Primero cargamos todas las librerías necesarias para el análisis. Usamos ggplot2 para visualización, DESeq2 para el análisis de expresión diferencial, EnhancedVolcano para crear gráficos volcano mejorados, y patchwork/gridExtra para combinar visualizaciones.
+
+```{r}
+library(ggplot2)
+library(patchwork)
+library(DESeq2)
+library(EnhancedVolcano)
+library(gridExtra)
+library(dplyr)
+```
+
+
+## Definición de funciones
+
+### Función para crear gráficos PCA
+
+Esta función genera gráficos PCA personalizados a partir de los objetos DESeq2. El análisis de componentes principales nos permite visualizar la variabilidad entre muestras y evaluar la separación entre diferentes condiciones experimentales.
+```{r}
+
+# Función para crear PCA plot personalizado
+custom_pca_plot <- function(dds, title = NULL) {
+  # Realizar transformación de varianza
+  vsd <- vst(dds, blind = FALSE)
+  
+  # Crear PCA plot con ajustes de tamaño y estilo
+  p <- plotPCA(vsd, intgroup = "condition") +
+    theme_minimal() +  # Tema más limpio
+    theme(
+      plot.title = element_text(size = 10, hjust = 0.5),  # Título más pequeño
+      axis.title = element_text(size = 8),  # Títulos de ejes más pequeños
+      axis.text = element_text(size = 6),   # Etiquetas de ejes más pequeñas
+      legend.title = element_text(size = 8),  # Título de leyenda más pequeño
+      legend.text = element_text(size = 6)    # Texto de leyenda más pequeño
+    ) +
+    ggtitle(title)  # Añadir título personalizado
+  
+  return(p)
+}
+
+```
+
+
+### Función para crear gráficos Volcano
+
+Esta función genera gráficos Volcano mejorados para visualizar los resultados de expresión diferencial. Los gráficos Volcano muestran la significancia estadística (valor p ajustado) frente al cambio en la expresión (log2FoldChange), permitiendo identificar fácilmente genes up-regulated (rojo), down-regulated (azul) y no significativos (gris).
+```{r}
+
+plot_volcano <- function(file_path, title) {
+  res_df <- read.csv(file_path) %>%
+    filter(!is.na(significant))  # Elimina NA en columnas clave
+  
+  keyvals <- setNames(c("red", "blue", "grey"), c("Up", "Down", "NS"))
+  
+  colores <- keyvals[res_df$significant]
+  #colores[is.na(colores)] <- "black"
+  p <- EnhancedVolcano(res_df,
+                       lab = res_df$gene_name,
+                       x = 'log2FoldChange',
+                       y = 'padj',
+                       title = paste('Differential Expression: ', title),
+                       pCutoff = 0.05,
+                       FCcutoff = 1,
+                       pointSize = 2.5,     # Reducir tamaño de puntos
+                       labSize = 3.0,       # Reducir tamaño de etiquetas
+                       colCustom = colores,
+                       colAlpha = 0.4,
+                       legendPosition = 'right',
+                       legendLabSize = 10,  # Reducir tamaño de leyenda
+                       legendIconSize = 3.0,
+                       drawConnectors = TRUE,
+                       widthConnectors = 0.5,
+                       ylab = "-log10(padj)"
+  ) + 
+    theme_minimal(base_size = 12) +  # Tema base más pequeño
+    theme(
+      plot.title = element_text(size = 14, hjust = 0.5),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10)
+    ) +
+    labs(color = "Significancia")
+  return(p)
+}
+```
+
+## Definición de archivos de entrada
+
+Definimos las rutas de los archivos de entrada para nuestro análisis. Utilizamos dos tipos de archivos:
+
+1. Objetos DESeq2 (dds) guardados en formato RDS que contienen los datos normalizados
+2. Archivos CSV con los resultados de DESeq2 que contienen información sobre genes diferencialmente expresados
+```{r}
+
+dds_files <- list(
+  "U5A_vs_CTRL" = "../dds_A.rds",
+  "U5B_vs_CTRL" = "../dds_B.rds",
+  "U5D_vs_CTRL" = "../dds_D.rds",
+  "U5E_vs_CTRL" = "../dds_E.rds",
+  "U5F_vs_CTRL" = "../dds_F.rds"
+)
+
+
+files <- list(
+  "U5A_vs_CTRL" = "../deseq2_resultsA.csv",
+  "U5B_vs_CTRL" = "../deseq2_resultsB.csv",
+  "U5D_vs_CTRL" = "../deseq2_resultsD.csv",
+  "U5E_vs_CTRL" = "../deseq2_resultsE.csv",
+  "U5F_vs_CTRL" = "../deseq2_resultsF.csv"
+)
+```
+
+
+## Generación de gráficos PCA
+
+Para cada comparación, cargamos el objeto DESeq2 correspondiente, generamos un gráfico PCA y lo guardamos tanto en formato PDF como PNG. Todos los gráficos se almacenan en una lista para su visualización posterior.
+```{r}
+# Lista para almacenar los plots
+plot_list <- list()
+
+# Generar plots para cada archivo
+for (name in names(dds_files)) {
+  # Cargar el objeto dds
+  dds <- readRDS(dds_files[[name]])
+  
+  # Crear PCA plot personalizado
+  plot <- custom_pca_plot(dds, title = name)
+  
+  # Añadir a la lista de plots
+  plot_list[[name]] <- plot
+  
+  
+  # Guardar el plot como PDF
+  ggsave(filename = paste0(name, "_PCA_plot.pdf"), plot = plot, width = 8, height = 4)
+
+  # Guardar como PNG también
+  ggsave(filename = paste0(name, "_PCA_plot.png"), plot = plot, width = 8, height = 4, dpi = 300)
+}
+```
+
+
+### Visualización de gráficos PCA individuales
+Mostramos todos los gráficos PCA generados para examinar la separación entre condiciones en cada comparación.
+```{r}
+plot_list
+```
+
+### Combinación de gráficos PCA
+
+Combinamos todos los gráficos PCA en una sola figura para facilitar la comparación entre diferentes condiciones. La figura combinada se guarda en formatos PDF y PNG.
+```{r}
+# Guardar plots en un solo PDF
+pdf("combined_pca_plots.pdf", width = 12, height = 8)
+do.call(grid.arrange, c(plot_list, ncol = 2))  # Organiza en 2 columnas
+dev.off()
+
+# Exportar a PNG en lugar de PDF
+png("combined_pca_plots.png", 
+    width = 12, 
+    height = 8, 
+    units = "in",  # Importante especificar unidades 
+    res = 300)     # Resolución alta para nitidez
+do.call(grid.arrange, c(plot_list, ncol = 2))  # Organiza en 2 columnas
+dev.off()
+
+
+```
+
+
+### Visualización de gráficos PCA combinados
+
+Mostramos la visualización combinada de todos los gráficos PCA directamente en el documento.
+```{r}
+do.call(grid.arrange, c(plot_list, ncol = 2))
+```
+
+
+## Generación de gráficos Volcano
+
+Para cada comparación, generamos un gráfico Volcano a partir de los resultados de DESeq2. Los gráficos se guardan en formatos PNG (con fondo transparente) y PDF (con fondo blanco) para su uso en presentaciones y publicaciones.
+
+```{r}
+
+# Lista para almacenar los plots
+volcano_plots <- list()
+
+for (name in names(files)) {
+  p <- plot_volcano(files[[name]], name)
+  
+  # Guardar en la lista
+  volcano_plots[[name]] <- p
+  
+  ggsave(
+    paste0("Volcano_", name, "_transparent.png"), 
+    p, 
+    width = 8,      
+    height = 7.5,    
+    dpi = 600,       
+    units = "in",
+    bg = "transparent"  # Fondo transparente
+  )
+  
+  # Exportar PNG con fondo blanco
+  ggsave(
+    paste0("Volcano_", name, "_white.pdf"), 
+    p, 
+    width = 8,      
+    height = 7.5,    
+    dpi = 600,       
+    units = "in",
+    bg = "white"  # Fondo blanco
+  )
+
+}
+```
+### Visualización de gráficos Volcano
+
+Mostramos todos los gráficos Volcano generados para examinar los genes diferencialmente expresados en cada comparación.
+```{r}
+volcano_plots
+```
+
+
+
+
+
+
+
+
+
+
+
