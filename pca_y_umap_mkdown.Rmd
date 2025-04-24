@@ -1,0 +1,624 @@
+---
+title: "Gene Expression Data Analysis with UMAP"
+author: "vale"
+date: "2025-04-02"
+output:
+  pdf_document: default
+  html_document: default
+---
+# RLOG
+## Procesamiento de datos de expresión génica con Salmon y DESeq2
+
+Este documento presenta el flujo de trabajo para procesar datos de conteos de genes generados por Salmon, prepararlos para el análisis de expresión diferencial, y realizar la normalización y filtrado necesarios antes del análisis con DESeq2. Además, incluye visualizaciones mediante PCA y UMAP para explorar patrones en los datos.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Configuración inicial y carga de librerías
+
+En este primer paso, cargamos todas las librerías necesarias para nuestro análisis. Estas librerías nos permitirán realizar la importación de datos, el preprocesamiento, el análisis diferencial y las visualizaciones.
+
+```{r}
+# --- Código PCA (Tu script hasta la generación de 'rlg') ---
+library(ggplot2)
+library(DESeq2)
+library(tidyverse)
+library(SummarizedExperiment) # Para acceder a assay() y colData()
+
+```
+## Definición de archivos de entrada
+
+Primero, definimos los archivos de conteos de Salmon que utilizaremos para cada una de nuestras condiciones experimentales. Estos archivos contienen conteos de genes normalizados por longitud generados por el brazo  Salmon del pipeline. 
+```{r}
+# Lista de archivos de Salmon
+salmon_files <- list(
+  "KO_U5A" = "salmon.merged.gene_counts_length_scaled_A.tsv",
+  "KO_U5B" = "salmon.merged.gene_counts_length_scaled_B.tsv",
+  "KO_U5D" = "salmon.merged.gene_counts_length_scaled_D.tsv",
+  "KO_U5E" = "salmon.merged.gene_counts_length_scaled_E.tsv",
+  "KO_U5F" = "salmon.merged.gene_counts_length_scaled_F.tsv"
+)
+```
+
+## Lectura y preprocesamiento de datos
+
+En este paso, leemos cada archivo TSV, identificamos las columnas de control y experimentales, y preparamos matrices de conteo para cada condición. Implementamos precauciones como la detección de genes duplicados y aseguramos que solo se incluyan columnas numéricas en los análisis. Este preprocesamiento es crucial para garantizar que los datos estén correctamente formateados para DESeq2.
+
+```{r}
+# Leer todos los archivos TSV
+salmon_data_list <- lapply(names(salmon_files), function(condition) {
+  file <- salmon_files[[condition]]
+  # Especificar tipos de columna puede prevenir problemas
+  data <- read_tsv(file, show_col_types = FALSE) # Ocultar mensajes
+  
+  # Separar columnas de control y condición experimental
+  ctrl_cols <- grep("CTRL", names(data), value = TRUE)
+  # Identificar columnas que NO son 'gene_id' y NO son 'CTRL' como experimentales
+  exp_cols <- setdiff(names(data)[!grepl("^gene_id$", names(data), ignore.case = TRUE)], ctrl_cols)
+  
+  # Seleccionar columnas: solo CTRL si es KO_U5A (o el primer archivo), sino solo exp_cols
+  if (condition == names(salmon_files)[1]) { # Más general, usa el primer elemento de la lista
+    selected_cols <- c("gene_id", ctrl_cols, exp_cols)
+  } else {
+    selected_cols <- c("gene_id", exp_cols)  # Sin CTRL
+  }
+  
+  # Filtrar columnas que realmente existen en el dataframe
+  selected_cols_exist <- intersect(selected_cols, names(data))
+  data_subset <- data[, selected_cols_exist]
+  
+  # Manejo de IDs duplicados (agregando por suma, como precaución)
+  if(any(duplicated(data_subset$gene_id))) {
+    cat("d\n")
+    warning(paste("Gene IDs duplicados encontrados en:", condition, "- Agrupando por suma."))
+    data_subset <- data_subset %>%
+      group_by(gene_id) %>%
+      # Asegurarse de sumar solo columnas numéricas
+      summarise(across(where(is.numeric), sum), .groups = 'drop') %>%
+      ungroup() # Asegurar desagrupar completamente
+  }
+  
+  data_matrix <- data_subset %>%
+    # Asegurar que no haya NAs en gene_id antes de poner como rownames
+    filter(!is.na(gene_id)) %>%
+    column_to_rownames(var = "gene_id") %>%
+    # Seleccionar solo columnas numéricas para la matriz
+    select(where(is.numeric)) %>%
+    as.matrix()
+  
+  return(data_matrix)
+})
+```
+
+
+## Preparación de información de muestras
+
+Extraemos la información sobre las muestras (nombres y condiciones) para construir el marco de datos colData que DESeq2 necesita. Este marco de datos establece la relación entre cada muestra y su condición experimental, lo que es esencial para el análisis diferencial posterior.
+```{r}
+# Nombres de las condiciones y muestras
+sample_info_list <- lapply(names(salmon_files), function(condition) {
+  file <- salmon_files[[condition]]
+  data <- read_tsv(file, show_col_types = FALSE)
+  
+  ctrl_cols <- grep("CTRL", names(data), value = TRUE)
+  exp_cols <- setdiff(names(data)[!grepl("^gene_id$", names(data), ignore.case = TRUE)], ctrl_cols)
+  exp_cols <- intersect(exp_cols, names(data)[sapply(data, is.numeric)]) # Asegurar que son columnas numéricas
+  
+  if (condition == names(salmon_files)[1]) {
+    samples <- c(ctrl_cols, exp_cols)
+    conditions <- c(rep("CTRL", length(ctrl_cols)), rep(condition, length(exp_cols)))
+  } else {
+    samples <- exp_cols
+    conditions <- rep(condition, length(exp_cols))
+  }
+  # Crear dataframe solo si hay muestras
+  if(length(samples) > 0) {
+    data.frame(sample = samples, condition = conditions)
+  } else {
+    NULL # Devolver NULL si no hay muestras (p.e., archivo vacío o mal formato)
+  }
+})
+```
+
+
+## Combinación de datos y preparación para DESeq2
+
+Combinamos los datos de todas las condiciones en una única matriz de conteos y aseguramos que solo se incluyan genes comunes a todos los archivos. También preparamos el dataframe colData necesario para DESeq2.
+```{r}
+
+# Combinar información de muestras (filtrando NULLs si los hubiera)
+sample_info <- do.call(rbind, Filter(Negate(is.null), sample_info_list))
+
+# Combinar counts - Asegurar que los genes comunes se usan y el orden de columnas es correcto
+gene_lists <- lapply(salmon_data_list, rownames)
+common_genes <- Reduce(intersect, gene_lists)
+
+# Filtrar matrices por genes comunes y reordenar columnas según sample_info
+combined_counts_list <- lapply(salmon_data_list, function(mat) mat[common_genes, , drop = FALSE])
+combined_counts <- do.call(cbind, combined_counts_list)
+combined_counts <- combined_counts[, sample_info$sample] # Ordenar columnas para que coincidan con sample_info
+
+# Limpiar NAs si existieran y redondear
+combined_counts[is.na(combined_counts)] <- 0
+count_matrix_int <- round(combined_counts)
+
+# Crear colData dataframe para DESeq2
+col_data_df <- data.frame(condition = factor(sample_info$condition))
+rownames(col_data_df) <- sample_info$sample
+
+```
+
+## Creación del objeto DESeq2, filtrado y normalización
+
+Creamos el objeto DESeqDataSet a partir de la matriz de conteos y el marco de datos colData. Luego aplicamos un filtrado estricto para eliminar genes con baja expresión y realizamos la normalización de varianza.
+
+```{r}
+# Crear un objeto DESeqDataSet
+dds <- DESeqDataSetFromMatrix(
+  countData = count_matrix_int,
+  colData = col_data_df,
+  design = ~ condition
+)
+
+cat("Dimensiones DDS ANTES de filtrar:", dim(dds), "\n")
+
+# --- INICIO: FILTRADO ESTRICTO GENERALIZADO ---
+unique_conditions <- levels(dds$condition)
+count_matrix_filt <- counts(dds)
+min_count_threshold <- 10
+condition_pass_matrix <- sapply(unique_conditions, function(cond) {
+  samples_in_condition <- colnames(dds)[dds$condition == cond]
+  if (length(samples_in_condition) == 0) { return(rep(FALSE, nrow(count_matrix_filt))) }
+  counts_subset <- count_matrix_filt[, samples_in_condition, drop = FALSE]
+  apply(counts_subset >= min_count_threshold, 1, all)
+})
+keep <- apply(condition_pass_matrix, 1, any)
+dds_filtered <- dds[keep, ]
+cat("Dimensiones DDS DESPUÉS de filtrar:", dim(dds_filtered), "\n")
+cat("Número de genes eliminados:", sum(!keep), "\n")
+cat("Número de genes conservados:", sum(keep), "\n")
+dds <- dds_filtered
+# --- FIN: FILTRADO ESTRICTO GENERALIZADO ---
+# Guardar la matriz de conteos filtrada
+filtered_counts <- counts(dds)
+write.csv(filtered_counts, file = "filtered_counts_matrix.csv")
+write.table(filtered_counts, file = "filtered_counts_matrix.tsv", sep = "\t", quote = FALSE)
+
+# Ejecutar el análisis completo de DESeq2
+    dds <- DESeq(dds)
+
+# Realizar transformación de varianza
+# Usar useT=TRUE puede ser más rápido si tienes muchos genes y pocas muestras
+rlg <- rlog(dds, blind = TRUE)
+# Guardar objetos importantes para análisis posteriores
+saveRDS(dds, file = "dds_complete.rds")
+saveRDS(rlg, file = "rlg_transform.rds")
+
+
+```
+
+# ============================================================
+# --- Inicio: Código PCA 1 y 2 auntomático ---
+# ============================================================
+
+## Análisis de Componentes Principales (PCA) automático
+
+El PCA es una técnica de reducción de dimensionalidad que nos permite visualizar la variabilidad entre muestras. Este gráfico automático utiliza la función plotPCA de DESeq2 y muestra las muestras en el espacio definido por los dos componentes principales que explican la mayor variabilidad en los datos.
+
+```{r}
+
+# --- PCA Plot (Tu código existente para el plot) ---
+pca_plot <- plotPCA(rlg, intgroup = "condition") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 9),
+    legend.title = element_text(face="bold"),
+    legend.text = element_text(size = 10)
+  ) +
+  ggtitle("Combined PCA Plot (Filtered & rlog)") +
+  scale_color_manual(values = c(
+    "CTRL" = "#8e86de",
+    "KO_U5A" = "#e25819",
+    "KO_U5B" = "#5a7172",
+    "KO_U5D" = "#02d539",
+    "KO_U5E" = "#6f18d7",
+    "KO_U5F" = "#eb4b93"
+  ))
+
+print(pca_plot)
+# Guardar PCA plot (opcional, ya lo tenías)
+ ggsave("combined_pca_plot_arreglado_con_filtro_estricto.png", pca_plot, width = 8, height = 6, dpi = 300)
+ ggsave("combined_pca_plot_arreglado_con_filtro_estricto.pdf", pca_plot, width = 8, height = 6)
+
+
+```
+
+
+# ============================================================
+# --- Inicio: Código PCA Manual  ---
+# ============================================================
+
+## PCA manual para exploración personalizada
+
+En esta sección, implementamos nuestro propio análisis PCA para tener mayor control sobre los parámetros y poder explorar diferentes componentes. Primero cargamos la librería adicional necesaria para el cálculo de varianzas.
+```{r}
+library(matrixStats) # Para rowVars()
+
+```
+
+```{r}
+
+
+# 1. Definir cuántos genes usar (igual que el default de plotPCA)
+ntop <- 500
+
+# 2. Extraer la matriz de datos transformados del objeto rlg
+rlog_matrix <- assay(rlg)
+
+# 3. Calcular la varianza para cada gen
+rv <- rowVars(rlog_matrix)
+
+# 4. Seleccionar los índices de los 'ntop' genes con mayor varianza
+select <- order(rv, decreasing = TRUE)[seq_len(min(ntop, length(rv)))]
+
+# 5. Subconjunto de la matriz rlog con los genes más variables
+rlog_top_genes <- rlog_matrix[select, ]
+
+# 6. Realizar PCA usando prcomp
+#    ¡Importante! prcomp espera muestras en filas y genes en columnas, así que transponemos t()
+pca_result <- prcomp(t(rlog_top_genes))
+#cat("PCs:",colnames(pca_result))
+
+# 7. Calcular el porcentaje de varianza explicado por cada PC
+percentVar <- round(100 * (pca_result$sdev^2 / sum(pca_result$sdev^2)))
+
+# 8. Crear un data frame con las coordenadas de los PCs que necesitas (PC1, PC3)
+#    y la información de la condición.
+pca_data_manual <- data.frame(
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2], # Podríamos incluir PC2 si quisiéramos
+  PC3 = pca_result$x[, 3], # ¡Aquí está PC3!
+  condition = colData(rlg)$condition, # Obtener condiciones del objeto rlg original
+  sample = colnames(rlg)             # Opcional: añadir nombres de muestra
+)
+
+# Total de columnas antes de selección
+#print(colnames(pca_result$x))
+
+# Verificar los nombres de las columnas (opcional)
+#print(colnames(pca_data_manual))
+# Verificar los niveles de condición (importante para colores)
+cat("condition\n")
+print(levels(pca_data_manual$condition))
+
+
+
+```
+### Visualización de PC1 vs PC2
+
+Creamos un gráfico de dispersión que muestra las muestras en el espacio definido por los dos primeros componentes principales, que son los que capturan la mayor variabilidad en los datos.
+```{r}
+
+# 9. Crear el gráfico usando ggplot2, ahora con pca_data_manual
+pca_plot_pc1_pc2 <- ggplot(pca_data_manual, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3, alpha = 0.8) +
+  # Etiquetas de los ejes con porcentaje de varianza
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) + # Usar percentVar[3]
+  # Título del gráfico
+  ggtitle(paste0("PCA Plot: PC1 vs PC2 (Top ",ntop," Variable Genes on rlog Data)")) +
+  # Aplicar el tema minimalista y otros ajustes de tema
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 9),
+    legend.title = element_text(face="bold"),
+    legend.text = element_text(size = 10)
+  ) +
+  # Aplicar la escala de colores manual
+  # ¡Asegúrate de que los nombres ("CTRL", "KO_U5A", etc.) coinciden
+  # con los niveles en pca_data_manual$condition!
+  scale_color_manual(values = c(
+    "CTRL" = "#8e86de",
+    "KO_U5A" = "#e25819",
+    "KO_U5B" = "#5a7172",
+    "KO_U5D" = "#02d539",
+    "KO_U5E" = "#6f18d7",
+    "KO_U5F" = "#eb4b93"
+  )) +
+  coord_fixed() # Opcional
+
+# 10. Mostrar el gráfico
+print(pca_plot_pc1_pc2)
+
+# 11. Guardar el gráfico PC1 vs PC3
+ggsave("pca_plot_PC1_vs_PC2_manual.png", pca_plot_pc1_pc2, width = 8, height = 7, dpi = 300)
+ggsave("pca_plot_PC1_vs_PC2_manual.pdf", pca_plot_pc1_pc2, width = 8, height = 7)
+
+message("PCA plot PC1 vs PC2 (manual) guardado en 'pca_plot_PC1_vs_PC2_manual.png' y '.pdf'")
+
+
+```
+### Visualización de PC1 vs PC3
+
+A veces el tercer componente principal puede revelar patrones adicionales no visibles en los dos primeros componentes. Creamos un gráfico que muestra PC1 vs PC3 para complementar nuestro análisis.
+```{r}
+
+# 9. Crear el gráfico usando ggplot2, ahora con pca_data_manual
+pca_plot_pc1_pc3 <- ggplot(pca_data_manual, aes(x = PC1, y = PC3, color = condition)) +
+  geom_point(size = 3, alpha = 0.8) +
+  # Etiquetas de los ejes con porcentaje de varianza
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC3: ", percentVar[3], "% variance")) + # Usar percentVar[3]
+  # Título del gráfico
+  ggtitle(paste0("PCA Plot: PC1 vs PC3 (Top ",ntop," Variable Genes on rlog Data)")) +
+  # Aplicar el tema minimalista y otros ajustes de tema
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 9),
+    legend.title = element_text(face="bold"),
+    legend.text = element_text(size = 10)
+  ) +
+  # Aplicar la escala de colores manual
+  # ¡Asegúrate de que los nombres ("CTRL", "KO_U5A", etc.) coinciden
+  # con los niveles en pca_data_manual$condition!
+  scale_color_manual(values = c(
+    "CTRL" = "#8e86de",
+    "KO_U5A" = "#e25819",
+    "KO_U5B" = "#5a7172",
+    "KO_U5D" = "#02d539",
+    "KO_U5E" = "#6f18d7",
+    "KO_U5F" = "#eb4b93"
+  )) +
+  coord_fixed() # Opcional
+
+# 10. Mostrar el gráfico
+print(pca_plot_pc1_pc3)
+
+# 11. Guardar el gráfico PC1 vs PC3
+ggsave("pca_plot_PC1_vs_PC3_manual.png", pca_plot_pc1_pc3, width = 8, height = 7, dpi = 300)
+ggsave("pca_plot_PC1_vs_PC3_manual.pdf", pca_plot_pc1_pc3, width = 8, height = 7)
+
+message("PCA plot PC1 vs PC3 (manual) guardado en 'pca_plot_PC1_vs_PC3_manual.png' y '.pdf'")
+
+
+```
+# ============================================================
+# --- Inicio: Código UMAP ---
+# ============================================================
+
+## Análisis UMAP para visualización no lineal
+
+El Uniform Manifold Approximation and Projection (UMAP) es una técnica de reducción de dimensionalidad más moderna que puede capturar relaciones no lineales entre muestras. Cargamos las librerías necesarias para implementar UMAP.
+
+```{r}
+# Cargar librerías necesarias para UMAP y manejo de datos
+library(uwot)       # Para umap() - más rápido y mantenido que 'umap' package
+library(dplyr)       # Para %>% y manipulación de dataframes
+
+```
+
+### Función para análisis UMAP
+
+Creamos una función personalizada para ejecutar análisis UMAP con diferentes parámetros, lo que nos permite explorar sistemáticamente cómo distintas configuraciones afectan la visualización de nuestros datos.
+```{r}
+# Función para ejecutar UMAP con parámetros personalizables
+run_umap_analysis <- function(rlog_matrix, sample_data, n_top_genes = 1000, n_neighbors = 8, 
+                             min_dist = 0.1, random_seed = 123, my_colors = NULL) {
+  
+  # Verificar si hay colores definidos, si no, usar colores por defecto
+  if (is.null(my_colors)) {
+    my_colors <- c(
+      "CTRL" = "#8e86de",
+      "KO_U5A" = "#e25819",
+      "KO_U5B" = "#5a7172", 
+      "KO_U5D" = "#02d539",
+      "KO_U5E" = "#6f18d7",
+      "KO_U5F" = "#eb4b93"
+    )
+  }
+  
+  cat("\n--- Ejecutando UMAP con", n_top_genes, "genes y", n_neighbors, "vecinos ---\n")
+  
+  # Calcular la varianza por gen en los datos rlog
+  gene_variances <- rowVars(rlog_matrix)
+  
+  # Asegurarse de no pedir más genes de los que hay después del filtrado
+  n_top_genes <- min(n_top_genes, nrow(rlog_matrix))
+  cat("Usando los", n_top_genes, "genes más variables para UMAP.\n")
+  
+  # Obtener los índices de los N genes más variables
+  top_var_gene_indices <- head(order(gene_variances, decreasing = TRUE), n_top_genes)
+  
+  # Calcular la varianza total y el porcentaje que representan los genes seleccionados
+  total_variance <- sum(gene_variances)
+  selected_genes_variance <- sum(gene_variances[top_var_gene_indices])
+  variance_percentage <- (selected_genes_variance / total_variance) * 100
+  cat("Los", n_top_genes, "genes más variables representan", 
+      round(variance_percentage, 2), "% de la varianza total\n")
+  
+  # Subconjunto de la matriz rlog con los genes más variables
+  rlog_matrix_top_genes <- rlog_matrix[top_var_gene_indices, ]
+  
+  # Ejecutar UMAP (uwot espera muestras x genes, así que transponemos t())
+  set.seed(random_seed) # Para reproducibilidad
+  umap_result_genes <- uwot::umap(
+    t(rlog_matrix_top_genes),
+    n_neighbors = n_neighbors,
+    min_dist = min_dist,
+    metric = "euclidean",
+    verbose = TRUE
+  )
+  
+  # Preparar datos para ggplot
+  umap_plot_data_genes <- data.frame(
+    UMAP1 = umap_result_genes[, 1],
+    UMAP2 = umap_result_genes[, 2],
+    condition = sample_data$condition,
+    sample = rownames(sample_data)
+  )
+  
+  # Crear el plot UMAP
+  umap_plot_genes <- ggplot(umap_plot_data_genes, aes(x = UMAP1, y = UMAP2, 
+                                                      color = condition)) +
+    geom_point(size = 3, alpha = 0.9) +
+    scale_color_manual(values = my_colors) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.title = element_text(face="bold")
+    ) +
+    ggtitle(paste0("UMAP (Top ", n_top_genes, " Variable Genes, ", 
+                  n_neighbors, " Neighbors)")) +
+    xlab("UMAP Component 1") +
+    ylab("UMAP Component 2")
+  
+  # Mostrar el gráfico
+  print(umap_plot_genes)
+  
+  # Guardar los archivos
+  filename_base <- paste0("umap_top_", n_top_genes, "_var_genes_", n_neighbors, "_neighbors")
+  ggsave(paste0(filename_base, ".png"), umap_plot_genes, width = 8, height = 6, dpi = 300)
+  ggsave(paste0(filename_base, ".pdf"), umap_plot_genes, width = 8, height = 6)
+  
+  # Devolver resultados para uso posterior si es necesario
+  return(list(
+    plot = umap_plot_genes,
+    data = umap_plot_data_genes,
+    umap_coords = umap_result_genes,
+    variance_explained = variance_percentage
+  ))
+}
+```
+
+### UMAP con 2000 genes más variables
+
+Ejecutamos UMAP usando los 2000 genes más variables para capturar un amplio espectro de patrones de expresión. Esta configuración equilibra la inclusión de suficiente información biológica mientras mantiene un enfoque en los genes más informativos.
+```{r}
+# Definir colores
+my_colors <- c(
+  "CTRL" = "#8e86de",
+  "KO_U5A" = "#e25819",
+  "KO_U5B" = "#5a7172",
+  "KO_U5D" = "#02d539",
+  "KO_U5E" = "#6f18d7",
+  "KO_U5F" = "#eb4b93"
+)
+
+# Extraer la matriz rlog y la información de muestras
+rlog_matrix <- assay(rlg)
+sample_data <- colData(rlg) # Contiene la columna 'condition'
+
+umap_result_custom <- run_umap_analysis(
+  rlog_matrix, 
+  colData(rlg),
+  n_top_genes = 2000, 
+  n_neighbors = 8,
+  min_dist = 0.1,
+  random_seed = 123, 
+  my_colors = my_colors
+)
+
+
+```
+### UMAP con 1000 genes más variables
+
+Repetimos el análisis UMAP pero con los 1000 genes más variables. Comparar ambos resultados (1000 vs 2000 genes) nos permite evaluar la robustez de los patrones observados y determinar cuánta información adicional aportan los genes menos variables.
+```{r}
+umap_result_custom <- run_umap_analysis(
+  rlog_matrix, 
+  colData(rlg),
+  n_top_genes = 1000, 
+  n_neighbors = 8,
+  min_dist = 0.1,
+  random_seed = 123, 
+  my_colors = my_colors
+)
+```
+
+
+
+# ============================================================
+# --- Código UMAP desde componentes PCA ---
+# ============================================================
+
+## UMAP a partir de componentes PCA
+
+Finalmente, exploramos una estrategia alternativa: ejecutar UMAP no directamente sobre los datos de expresión, sino sobre los componentes principales extraídos previamente. Este enfoque puede ser útil para reducir el ruido y enfocarse en la señal principal capturada por el PCA.
+
+```{r}
+
+# Extraer los componentes principales del resultado PCA
+# Puedes decidir cuántos componentes usar (por ejemplo, los primeros 10-20 PCs)
+
+n_pcs_to_use <- 5  # Ajusta según sea necesario
+pca_components <- pca_result$x[, 1:min(n_pcs_to_use, ncol(pca_result$x))]
+
+
+#specific_pcs <- c(1, 3)  # Índices de los PCs específicos que quieres usar
+#pca_components <- pca_result$x[, specific_pcs]
+# Calcular cuánta varianza explican estos componentes
+var_explained <- sum(percentVar[1:n_pcs_to_use]) / sum(percentVar)
+#var_explained <- sum(percentVar[specific_pcs]) / sum(percentVar)
+cat("Los primeros",n_pcs_to_use," PCs explican", round(var_explained * 100, 2), "% de la varianza total\n")
+
+# Configuración de UMAP
+set.seed(123)  # Para reproducibilidad
+n_neighbors <- 8  # Similar a tu UMAP anterior
+
+# Ejecutar UMAP sobre los componentes PCA
+umap_from_pca <- uwot::umap(
+  pca_components,
+  n_neighbors = n_neighbors,
+  min_dist = 0.1,
+  metric = "euclidean",
+  verbose = TRUE
+)
+
+# Crear dataframe para visualización
+umap_pca_df <- data.frame(
+  UMAP1 = umap_from_pca[, 1],
+  UMAP2 = umap_from_pca[, 2],
+  condition = colData(rlg)$condition,
+  sample = colnames(rlg)
+)
+
+# Definir los mismos colores que usaste anteriormente
+my_colors <- c(
+  "CTRL" = "#8e86de",
+  "KO_U5A" = "#e25819",
+  "KO_U5B" = "#5a7172",
+  "KO_U5D" = "#02d539",
+  "KO_U5E" = "#6f18d7",
+  "KO_U5F" = "#eb4b93"
+)
+
+# Crear el gráfico
+umap_pca_plot <- ggplot(umap_pca_df, aes(x = UMAP1, y = UMAP2, color = condition)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_manual(values = my_colors) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.title = element_text(face = "bold")
+  ) +
+  ggtitle(paste0("UMAP from first ", n_pcs_to_use, " PCs (", n_neighbors, " neighbors)")) +
+  xlab("UMAP Component 1") +
+  ylab("UMAP Component 2")
+
+# Mostrar y guardar el gráfico
+print(umap_pca_plot)
+ggsave(paste0("umap_from_pca_", n_pcs_to_use, "_pcs_", n_neighbors, "_neighbors.png"), 
+       umap_pca_plot, width = 8, height = 6, dpi = 300)
+ggsave(paste0("umap_from_pca_", n_pcs_to_use, "_pcs_", n_neighbors, "_neighbors.pdf"), 
+       umap_pca_plot, width = 8, height = 6)
+```
+
+
+
