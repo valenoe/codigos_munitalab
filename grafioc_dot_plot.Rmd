@@ -1,0 +1,209 @@
+---
+title: "Untitled"
+author: "vale"
+date: "2025-04-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Cargar librerías
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(tidyverse)
+
+```
+
+
+
+
+```{r}
+# Función para sacar el promedio de los valores separados por coma
+get_mean_psi <- function(x) {
+  vals <- as.numeric(unlist(strsplit(x, ",")))
+  mean(vals, na.rm = TRUE)
+}
+```
+
+
+
+```{r}
+graficar_psi <- function(df, etiqueta_x = "PSI WT", etiqueta_y = "PSI KO",
+                         nombre_archivo = "grafico_PSI.png",
+                         umbral = 0.1, tamano_fondo = 0.3, tamano_resaltados = 1,
+                         ancho = 8, alto = 8, FDR_value, letra = "", evento = "") {
+  
+  # Calcular PSI promedio por condición
+  df <- df %>%
+    mutate(
+      PSI_KO = sapply(IncLevel1, get_mean_psi),
+      PSI_WT = sapply(IncLevel2, get_mean_psi),
+      dPSI = PSI_KO - PSI_WT
+    )
+  
+  # Calcular dPSI si no existe
+  if (!"dPSI" %in% colnames(df)) {
+    df <- df %>%
+      mutate(dPSI = PSI_KO - PSI_WT)
+  }
+  
+  # Crear gráfico
+  p <- ggplot(df, aes(x = PSI_WT, y = PSI_KO)) +
+    geom_point(alpha = 0.2, color = "gray40", size = tamano_fondo) +
+    geom_point(data = df %>% filter(dPSI > umbral, FDR < FDR_value), #cumple_profundidad == TRUE), 
+               aes(x = PSI_WT, y = PSI_KO), color = "red", size = tamano_resaltados) +
+    geom_point(data = df %>% filter(dPSI < -umbral, FDR < FDR_value), #cumple_profundidad == TRUE), 
+               aes(x = PSI_WT, y = PSI_KO), color = "dodgerblue", size = tamano_resaltados) +
+    theme_classic() +
+    labs(
+    title = paste0("RNU5", letra, " KO - Evento ", evento),
+    subtitle = paste0("Umbral dPSI: ", umbral, ", FDR < ", FDR_value),
+    x = etiqueta_x, 
+    y = etiqueta_y
+  ) +
+  coord_fixed(xlim = c(0, 1), ylim = c(0, 1))
+  
+ # Crear directorio si no existe
+dir.create("graficos_paper_rmats", showWarnings = FALSE)
+
+# Construir rutas completas para los archivos
+ruta_png <- file.path("graficos_paper_rmats", nombre_archivo)
+ruta_pdf <- file.path("graficos_paper_rmats", gsub("\\.png$", ".pdf", nombre_archivo))
+
+# Guardar imagen en PNG
+ggsave(ruta_png, plot = p, width = ancho, height = alto, dpi = 300)
+
+# Guardar imagen en PDF
+ggsave(ruta_pdf, plot = p, width = ancho, height = alto)
+  
+  return(p)
+}
+
+
+```
+
+
+
+```{r}
+# Definir vectores de letras y eventos
+letras <- c("A", "B", "D", "E", "F")
+eventos <- c("SE", "MXE", "RI", "A5SS", "A3SS")
+```
+
+```{r}
+
+
+# Ciclo para procesar todos los archivos
+for (letra in letras) {
+  for (evento in eventos) {
+    # Construir nombre de archivo
+    nombre_archivo <- paste0("novelSSfalse_", letra, "_analysis8_", evento, ".MATS.JCEC.txt")
+    cat(nombre_archivo)
+    
+    # Verificar si el archivo existe antes de procesarlo
+    if (file.exists(nombre_archivo)) {
+      # Leer el archivo
+      df <- read_tsv(nombre_archivo)
+      
+      # Crear nombre para el gráfico
+      nombre_grafico <- paste0("grafico_PSI_", letra, "_", evento, "_filtro8_basic_novelSSfalse.png")
+      cat("\n", nombre_grafico)
+      
+      # Ejecutar la función graficar_psi
+      grafico <- graficar_psi(
+        df, 
+        etiqueta_x = "PSI WT", 
+        etiqueta_y = paste0("PSI RNU5", letra," KO") ,
+        nombre_archivo = nombre_grafico,
+        umbral = 0.2,
+        tamano_fondo = 0.3, 
+        tamano_resaltados = 1,
+        ancho = 8,
+        alto = 8,
+        FDR_value = 0.05,
+        letra,
+        evento
+      )
+      
+      # Mensaje de confirmación
+      cat(paste0("Procesado: ", nombre_archivo, "\n"))
+    } else {
+      # Mensaje si el archivo no existe
+      cat(paste0("Archivo no encontrado: ", nombre_archivo, "\n"))
+    }
+  }
+}
+```
+
+
+```{r}
+
+
+
+
+# Procesar cada letra
+for (letra in letras) {
+  # Lista para almacenar los dataframes de cada evento
+  dfs_evento <- list()
+  
+  # Leer y procesar cada evento para la letra actual
+  for (evento in eventos) {
+    # Construir nombre de archivo
+    nombre_archivo <- paste0("novelSSfalse_", letra, "_analysis8_", evento, ".MATS.JCEC.txt")
+    
+    # Verificar si el archivo existe
+    if (file.exists(nombre_archivo)) {
+      # Leer el archivo
+      df_temp <- read_tsv(nombre_archivo)
+      
+      # Añadir columna que indica el tipo de evento
+      df_temp$tipo_evento <- evento
+      
+      # Añadir a la lista
+      dfs_evento[[evento]] <- df_temp
+      cat(paste0("Archivo leído: ", nombre_archivo, "\n"))
+    } else {
+      cat(paste0("Archivo no encontrado: ", nombre_archivo, "\n"))
+    }
+  }
+  
+  # Combinar todos los dataframes para esta letra
+  if (length(dfs_evento) > 0) {
+    df_combinado <- bind_rows(dfs_evento)
+    
+    # Generar el gráfico combinado usando la función existente
+    nombre_grafico <- paste0("grafico_PSI_", letra, "_todos_eventos_filtro8_basic_novelSSfalse.png.png")
+    
+    # Llamar a tu función graficar_psi con el dataframe combinado
+    grafico <- graficar_psi(
+      df_combinado, 
+      etiqueta_x = "PSI WT", 
+      etiqueta_y = paste0("PSI RNU5", letra," KO") ,
+      nombre_archivo = nombre_grafico,
+      umbral = 0.2,
+      tamano_fondo = 0.3, 
+      tamano_resaltados = 1,
+      ancho = 8,
+      alto = 8,
+      FDR_value = 0.05,
+      letra = letra,
+      evento = "SE + RI + MXE + A5SS + A3SS"
+    )
+    
+    
+   
+    
+    cat(paste0("Gráfico generado para letra ", letra, "\n"))
+  } else {
+    cat(paste0("No se encontraron archivos para la letra ", letra, "\n"))
+  }
+}
+```
+
+
+
+
